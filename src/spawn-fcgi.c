@@ -543,7 +543,12 @@ static int fcgi_spawn_connection(char *appPath, char **appArgv, int fcgi_fd, int
 				{
 					i = 0;
 					len = sizeof(i);
+#ifdef __FreeBSD__
 					getsockopt(fcgi_fd, SOL_SOCKET, SO_LISTENINCQLEN, &i, &len);
+#else
+					// TODO: check real queue length retured (compare with ss -l)
+					getsockopt(fcgi_fd, SOL_SOCKET, SO_LISTENQLEN, &i, &len);
+#endif
 					if ( i > 0 )
 					{
 						fprintf(stderr, " inc %d\n", i);
