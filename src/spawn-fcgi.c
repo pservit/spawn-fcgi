@@ -504,6 +504,8 @@ static int fcgi_spawn_connection(char *appPath, char **appArgv, int fcgi_fd, int
 					rc = st;
 				}
 			}
+			
+#ifdef SO_LISTENQLEN
 			if ( max_fork_count > 0 && cur_fork_count < max_fork_count && 
 				!fork_count && 
 				(last_add_new_child + 10) < time(NULL) &&
@@ -543,12 +545,8 @@ static int fcgi_spawn_connection(char *appPath, char **appArgv, int fcgi_fd, int
 				{
 					i = 0;
 					len = sizeof(i);
-#ifdef __FreeBSD__
 					getsockopt(fcgi_fd, SOL_SOCKET, SO_LISTENINCQLEN, &i, &len);
-#else
-					// TODO: check real queue length retured (compare with ss -l)
-					getsockopt(fcgi_fd, SOL_SOCKET, SO_LISTENQLEN, &i, &len);
-#endif
+
 					if ( i > 0 )
 					{
 						fprintf(stderr, " inc %d\n", i);
@@ -593,7 +591,7 @@ static int fcgi_spawn_connection(char *appPath, char **appArgv, int fcgi_fd, int
 					check_null_qlen_count = 0;
 				}
 			}
-
+#endif
 
 
 			
@@ -909,5 +907,10 @@ int main(int argc, char **argv) {
 		return -1;
 	}
 	daemon(1, 1);
+	
+#ifndef SO_LISTENQLEN
+	fork_count = max_fork_count;
+#endif
+	
 	return fcgi_spawn_connection(fcgi_app, fcgi_app_argv, fcgi_fd, fork_count, max_fork_count, child_count, pid_fd, nofork, fcgi_dir);
 }
