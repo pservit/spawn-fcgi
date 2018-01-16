@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,7 @@
 # include <netinet/tcp.h>
 # include <sys/un.h>
 # include <arpa/inet.h>
+# include <signal.h>
 
 # include <netdb.h>
 
@@ -48,6 +50,10 @@ static int issetugid() {
 }
 #endif
 
+int cur_child_pos = 0;
+int cur_child_size = 0;
+pid_t childs[1000];
+
 #if defined(HAVE_IPV6) && defined(HAVE_INET_PTON)
 # define USE_IPV6
 #endif
@@ -61,6 +67,36 @@ static int issetugid() {
 #define PACKAGE_DESC "spawn-fcgi v" PACKAGE_VERSION PACKAGE_FEATURES " - spawns FastCGI processes\n"
 
 #define CONST_STR_LEN(s) s, sizeof(s) - 1
+
+void sig_handler(int sig)
+{
+	switch (sig)
+	{
+		case SIGTERM:
+		case SIGINT:
+		case SIGHUP:
+			for (int i = 0 ; i<cur_child_size ; ++i)
+			{
+				if (childs[i])
+				{
+					kill(childs[i], sig);
+				}
+			}
+			exit(1);
+			break;
+	}	
+}
+
+void sig_init(void)
+{
+	struct sigaction act;
+
+	memset(&act,0,sizeof(act));
+	act.sa_handler = sig_handler;
+	act.sa_flags = SA_RESTART;
+	sigaction(SIGINT,&act,NULL);
+	sigaction(SIGTERM,&act,NULL);
+}
 
 static mode_t read_umask(void) {
 	mode_t mask = umask(0);
@@ -226,134 +262,337 @@ static int bind_socket(const char *addr, unsigned short port, const char *unixso
 	return fcgi_fd;
 }
 
-static int fcgi_spawn_connection(char *appPath, char **appArgv, int fcgi_fd, int fork_count, int child_count, int pid_fd, int nofork) {
+static int start_one_process(char *appPath, char **appArgv, int fcgi_fd, int nofork, char* fcgi_dir) 
+{
+	int max_fd = 0;
+
+	int i = 0;
+
+	if ( fcgi_dir && -1 == chdir(fcgi_dir) ) 
+	{
+		return -1;
+	}
+
+
+	if(fcgi_fd != FCGI_LISTENSOCK_FILENO) 
+	{
+		close(FCGI_LISTENSOCK_FILENO);
+		dup2(fcgi_fd, FCGI_LISTENSOCK_FILENO);
+		close(fcgi_fd);
+	}
+
+	if (!nofork) 
+	{
+		setsid();
+
+		max_fd = open("/dev/null", O_RDWR);
+		if (-1 != max_fd) 
+		{
+			if (max_fd != STDOUT_FILENO) dup2(max_fd, STDOUT_FILENO);
+			if (max_fd != STDERR_FILENO) dup2(max_fd, STDERR_FILENO);
+			if (max_fd != STDOUT_FILENO && max_fd != STDERR_FILENO) close(max_fd);
+		}
+		else
+		{
+			fprintf(stderr, "spawn-fcgi: couldn't open and redirect stdout/stderr to '/dev/null': %s\n", strerror(errno));
+		}
+	}
+
+	/* we don't need the client socket */
+	for (i = 3; i < max_fd; i++) {
+		if (i != FCGI_LISTENSOCK_FILENO) close(i);
+	}
+
+	/* fork and replace shell */
+	if (appArgv) {
+		execv(appArgv[0], appArgv);
+	}
+	else
+	{
+		char *b = malloc((sizeof("exec ") - 1) + strlen(appPath) + 1);
+		strcpy(b, "exec ");
+		strcat(b, appPath);
+
+		/* exec the cgi */
+		execl("/bin/sh", "sh", "-c", b, (char *)NULL);
+	}
+
+	/* in nofork mode stderr is still open */
+	fprintf(stderr, "spawn-fcgi: exec failed: %s\n", strerror(errno));
+	exit(errno);
+}
+
+static int fcgi_spawn_connection(char *appPath, char **appArgv, int fcgi_fd, int fork_count, int max_fork_count, int child_count, int pid_fd, int nofork, char* fcgi_dir) {
 	int status, rc = 0;
 	struct timeval tv = { 0, 100 * 1000 };
 
 	pid_t child;
 
-	while (fork_count-- > 0) {
+	char cgi_childs[64];
+	cur_child_pos = 0;
+	cur_child_size = fork_count;
+	memset(childs, 0, sizeof(childs));
+	int orig_fork_count         = fork_count;
+	time_t last_add_new_child   = time(NULL);
+	time_t last_check_add_qlen  = 0;
+	int check_add_qlen_count    = 0;
+	time_t last_rem_new_child   = time(NULL);
+	time_t last_check_null_qlen = 0;
+	int check_null_qlen_count   = 0;
 
-		if (!nofork) {
-			child = fork();
-		} else {
-			child = 0;
-		}
 
-		switch (child) {
-		case 0: {
-			char cgi_childs[64];
-			int max_fd = 0;
+	int cur_fork_count = 0;
 
-			int i = 0;
 
-			if (child_count >= 0) {
-				snprintf(cgi_childs, sizeof(cgi_childs), "PHP_FCGI_CHILDREN=%d", child_count);
-				putenv(cgi_childs);
-			}
-
-			if(fcgi_fd != FCGI_LISTENSOCK_FILENO) {
-				close(FCGI_LISTENSOCK_FILENO);
-				dup2(fcgi_fd, FCGI_LISTENSOCK_FILENO);
-				close(fcgi_fd);
-			}
-
-			/* loose control terminal */
+	while (1) 
+	{
+		if (fork_count>0)
+		{
 			if (!nofork) {
-				setsid();
-
-				max_fd = open("/dev/null", O_RDWR);
-				if (-1 != max_fd) {
-					if (max_fd != STDOUT_FILENO) dup2(max_fd, STDOUT_FILENO);
-					if (max_fd != STDERR_FILENO) dup2(max_fd, STDERR_FILENO);
-					if (max_fd != STDOUT_FILENO && max_fd != STDERR_FILENO) close(max_fd);
-				} else {
-					fprintf(stderr, "spawn-fcgi: couldn't open and redirect stdout/stderr to '/dev/null': %s\n", strerror(errno));
-				}
-			}
-
-			/* we don't need the client socket */
-			for (i = 3; i < max_fd; i++) {
-				if (i != FCGI_LISTENSOCK_FILENO) close(i);
-			}
-
-			/* fork and replace shell */
-			if (appArgv) {
-				execv(appArgv[0], appArgv);
-
+				child = fork();
 			} else {
-				char *b = malloc((sizeof("exec ") - 1) + strlen(appPath) + 1);
-				strcpy(b, "exec ");
-				strcat(b, appPath);
-
-				/* exec the cgi */
-				execl("/bin/sh", "sh", "-c", b, (char *)NULL);
-
-				free(b);
+				child = 0;
 			}
 
-			/* in nofork mode stderr is still open */
-			fprintf(stderr, "spawn-fcgi: exec failed: %s\n", strerror(errno));
-			exit(errno);
+			switch (child) 
+			{
+				case 0: 
+				{
+					if (child_count >= 0)
+					{
+						snprintf(cgi_childs, sizeof(cgi_childs), "PHP_FCGI_CHILDREN=%d", child_count);
+						putenv(cgi_childs);
+					}
+					start_one_process(appPath, appArgv, fcgi_fd, nofork, fcgi_dir);					
+					break;
+				}
+				case -1:
+					/* error */
+					fprintf(stderr, "spawn-fcgi: fork failed: %s\n", strerror(errno));
+					break;
+				default:
+					/* father */
 
-			break;
+					/* wait */
+					select(0, NULL, NULL, NULL, &tv);
+					fork_count--;
+					cur_fork_count++;
+
+					switch (waitpid(child, &status, WNOHANG)) 
+					{
+						case 0:
+							fprintf(stdout, "spawn-fcgi: child spawned successfully: PID: %d\n", child);
+							fprintf(stderr, "spawn-fcgi: child spawned successfully: PID: %d\n", child);
+							/* write pid file */
+				    		if (pid_fd != -1) 
+			    			{
+								/* assume a 32bit pid_t */
+								if ( cur_child_pos>= cur_child_size )
+								{
+									cur_child_size++;
+								}
+								childs[cur_child_pos] = child;
+								fprintf(stderr, "spawn-fcgi: child pos PID: %d->%d\n", cur_child_pos, child);
+								int i = 0;
+								for ( i=0 ; i<cur_child_size ; ++i )
+								{
+									if ( !childs[i] )
+									{
+										cur_child_pos = i;
+										break;
+									}
+								}
+								if ( i == cur_child_size )
+								{
+									cur_child_pos = cur_child_size;
+									cur_child_size++;
+								}
+
+
+								
+								char pidbuf[12];
+								if ( !fork_count )
+								{
+									ftruncate(pid_fd, 0);
+									lseek(pid_fd, 0, SEEK_SET);
+									snprintf(pidbuf, sizeof(pidbuf) - 1, "%d", getpid());
+									write(pid_fd, pidbuf, strlen(pidbuf));
+									/*if (cur_child_size)
+									{
+										write(pid_fd, "\n", 1);
+									}
+									for (int i=0 ; i<cur_child_size ; ++i)
+									{
+										snprintf(pidbuf, sizeof(pidbuf) - 1, "%d", childs[i]);
+										write(pid_fd, pidbuf, strlen(pidbuf));
+										if ((i+1) != cur_child_size)
+										{
+											write(pid_fd, "\n", 1);
+										}
+									}*/
+								}
+							}
+							break;
+						case -1:
+							break;
+						default:
+							if (WIFEXITED(status))
+							{
+								fprintf(stderr, "spawn-fcgi: startchild(%d) exited with: %d\n",
+								child, 
+								WEXITSTATUS(status));
+								rc = WEXITSTATUS(status);
+							}
+							else
+							if (WIFSIGNALED(status)) 
+							{
+								fprintf(stderr, "spawn-fcgi: startchild(%d) signaled: %d\n",
+								child, 
+								WTERMSIG(status));
+								rc = 1;
+							}
+							else
+							{
+								fprintf(stderr, "spawn-fcgi: startchild(%d) died somehow: exit status = %d\n", child, status);
+								rc = status;
+							}
+							exit(rc);
+							break;
+					}
+
+					break;
+			}
 		}
-		case -1:
-			/* error */
-			fprintf(stderr, "spawn-fcgi: fork failed: %s\n", strerror(errno));
-			break;
-		default:
-			/* father */
-
-			/* wait */
-			select(0, NULL, NULL, NULL, &tv);
-
-			switch (waitpid(child, &status, WNOHANG)) {
-			case 0:
-				fprintf(stdout, "spawn-fcgi: child spawned successfully: PID: %d\n", child);
-
-				/* write pid file */
-				if (-1 != pid_fd) {
-					/* assume a 32bit pid_t */
-					char pidbuf[12];
-
-					snprintf(pidbuf, sizeof(pidbuf) - 1, "%d", child);
-
-					if (-1 == write_all(pid_fd, pidbuf, strlen(pidbuf))) {
-						fprintf(stderr, "spawn-fcgi: writing pid file failed: %s\n", strerror(errno));
-						close(pid_fd);
-						pid_fd = -1;
-					}
-					/* avoid eol for the last one */
-					if (-1 != pid_fd && fork_count != 0) {
-						if (-1 == write_all(pid_fd, "\n", 1)) {
-							fprintf(stderr, "spawn-fcgi: writing pid file failed: %s\n", strerror(errno));
-							close(pid_fd);
-							pid_fd = -1;
-						}
+		if ( !nofork && !fork_count )
+		{
+			int st;
+			while ((child = waitpid(-1, &st, WNOHANG))>0)
+			{
+				--cur_fork_count;
+				if ( cur_fork_count < orig_fork_count )
+				{
+					fork_count++;
+				}
+				for (int i=0 ; i<cur_child_size ; ++i)
+				{
+					if (childs[i] == child)
+					{
+						childs[i] = 0;
+						cur_child_pos = i;
+						break;
 					}
 				}
-
-				break;
-			case -1:
-				break;
-			default:
-				if (WIFEXITED(status)) {
-					fprintf(stderr, "spawn-fcgi: child exited with: %d\n",
-						WEXITSTATUS(status));
-					rc = WEXITSTATUS(status);
-				} else if (WIFSIGNALED(status)) {
-					fprintf(stderr, "spawn-fcgi: child signaled: %d\n",
-						WTERMSIG(status));
+				if (WIFEXITED(st))
+				{
+					fprintf(stderr, "spawn-fcgi: child(%d) exited with: %d\n",
+					child, 
+					WEXITSTATUS(st));
+					rc = WEXITSTATUS(st);
+				}
+				else
+				if (WIFSIGNALED(st)) 
+				{
+					fprintf(stderr, "spawn-fcgi: child(%d) signaled: %d\n",
+					child, 
+					WTERMSIG(st));
 					rc = 1;
-				} else {
-					fprintf(stderr, "spawn-fcgi: child died somehow: exit status = %d\n",
-						status);
-					rc = status;
+				}
+				else
+				{
+					fprintf(stderr, "spawn-fcgi: child(%d) died somehow: exit status = %d\n", child, st);
+					
+					rc = st;
+				}
+			}
+			if ( max_fork_count > 0 && cur_fork_count < max_fork_count && 
+				!fork_count && 
+				(last_add_new_child + 10) < time(NULL) &&
+				(last_check_add_qlen + 3) < time(NULL) )
+			{
+				socklen_t len;
+				int i = 0;
+
+				len = sizeof(i);
+				getsockopt(fcgi_fd, SOL_SOCKET, SO_LISTENQLEN, &i, &len);
+				last_check_add_qlen = time(NULL);
+
+
+				if ( i > 0 )
+				{
+					++check_add_qlen_count;
+					
+					if ( i>10 || check_add_qlen_count>3 )
+					{
+						fprintf(stderr, "len %d\n", i);						
+						++fork_count;
+						if ( cur_child_size+1 < cur_fork_count )
+						{
+							++cur_child_size;
+						}
+						check_add_qlen_count = 0;
+						last_add_new_child = time(NULL);
+						fprintf(stderr, "add child %d %d %ld\n", i, cur_fork_count, time(NULL));						
+					}
+				}
+				else
+				{
+					check_add_qlen_count = 0;
+				}
+
+				if ( fork_count > 0 )
+				{
+					i = 0;
+					len = sizeof(i);
+					getsockopt(fcgi_fd, SOL_SOCKET, SO_LISTENINCQLEN, &i, &len);
+					if ( i > 0 )
+					{
+						fprintf(stderr, " inc %d\n", i);
+					}
 				}
 			}
 
-			break;
+			if ( max_fork_count > 0 && orig_fork_count < cur_fork_count && 
+				(last_add_new_child + 100) < time(NULL) && 
+				(last_check_null_qlen + 10) < time(NULL) &&
+				(last_rem_new_child + 30) < time(NULL) )
+			{
+				socklen_t len;
+				int i = 0;
+
+				len = sizeof(i);
+				getsockopt(fcgi_fd, SOL_SOCKET, SO_LISTENQLEN, &i, &len);
+				last_check_null_qlen = time(NULL);
+
+				if ( i == 0 )
+				{
+					++check_null_qlen_count;
+					if ( check_null_qlen_count >= 10 )
+					{
+						last_rem_new_child = time(NULL);
+						fprintf(stderr, "rem child %d %d %ld\n", i, cur_fork_count, time(NULL));
+
+						for ( i=0 ; i<cur_child_size ; ++i )
+						{
+							if ( childs[i]>0 )
+							{
+								fprintf(stderr, "kill %d %d %ld\n", i, childs[i], time(NULL));
+								kill(childs[i], SIGHUP);
+								break;
+							}
+						}
+						check_null_qlen_count = 0;
+					}
+				}
+				else
+				{
+					check_null_qlen_count = 0;
+				}
+			}
+
+
+
+			
+			usleep(100000);
 		}
 	}
 
@@ -450,6 +689,7 @@ static void show_help () {
 		" -C <children>  (PHP only) numbers of childs to spawn (default: not setting\n" \
 		"                the PHP_FCGI_CHILDREN environment variable - PHP defaults to 0)\n" \
 		" -F <children>  number of children to fork (default 1)\n" \
+		" -m <children>  max number of children to fork (default 1)\n" \
 		" -b <backlog>   backlog to allow on the socket (default 1024)\n" \
 		" -P <path>      name of PID-file for spawned process (ignored in no-fork mode)\n" \
 		" -n             no fork (for daemontools)\n" \
@@ -479,6 +719,7 @@ int main(int argc, char **argv) {
 	mode_t sockmode =  (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP) & ~read_umask();
 	int child_count = -1;
 	int fork_count = 1;
+	int max_fork_count = 16;
 	int backlog = 1024;
 	int i_am_root, o;
 	int pid_fd = -1;
@@ -493,8 +734,9 @@ int main(int argc, char **argv) {
 	}
 
 	i_am_root = (getuid() == 0);
+	sig_init();
 
-	while (-1 != (o = getopt(argc, argv, "c:d:f:g:?hna:p:b:u:vC:F:s:P:U:G:M:S"))) {
+	while (-1 != (o = getopt(argc, argv, "c:d:f:m:g:?hna:p:b:u:vC:F:s:P:U:G:M:S"))) {
 		switch(o) {
 		case 'f': fcgi_app = optarg; break;
 		case 'd': fcgi_dir = optarg; break;
@@ -507,6 +749,7 @@ int main(int argc, char **argv) {
 			break;
 		case 'C': child_count = strtol(optarg, NULL, 10);/*  */ break;
 		case 'F': fork_count = strtol(optarg, NULL, 10);/*  */ break;
+		case 'm': max_fork_count = strtol(optarg, NULL, 10);/*  */ break;
 		case 'b': backlog = strtol(optarg, NULL, 10);/*  */ break;
 		case 's': unixsocket = optarg; /* unix-domain socket */ break;
 		case 'c': if (i_am_root) { changeroot = optarg; }/* chroot() */ break;
@@ -660,6 +903,6 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "spawn-fcgi: chdir('%s') failed: %s\n", fcgi_dir, strerror(errno));
 		return -1;
 	}
-
-	return fcgi_spawn_connection(fcgi_app, fcgi_app_argv, fcgi_fd, fork_count, child_count, pid_fd, nofork);
+	daemon(1, 1);
+	return fcgi_spawn_connection(fcgi_app, fcgi_app_argv, fcgi_fd, fork_count, max_fork_count, child_count, pid_fd, nofork, fcgi_dir);
 }
